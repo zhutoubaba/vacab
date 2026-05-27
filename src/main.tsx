@@ -12,7 +12,7 @@ createRoot(document.getElementById('root')!).render(
 // Register custom vanilla Service Worker for offline PWA capabilities in production
 if ('serviceWorker' in navigator && import.meta.env.PROD) {
   window.addEventListener('load', () => {
-    navigator.serviceWorker.register('/sw.js')
+    navigator.serviceWorker.register('./sw.js')
       .then((reg) => {
         console.log('VocabBloom ServiceWorker registered with scope:', reg.scope);
       })

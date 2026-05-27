@@ -1,8 +1,8 @@
 const CACHE_NAME = 'vocab-bloom-v2';
 const ASSETS_TO_CACHE = [
-  '/',
-  '/index.html',
-  '/favicon.svg'
+  './',
+  './index.html',
+  './favicon.svg'
 ];
 
 // Install Event - Pre-caches critical page shell
@@ -92,7 +92,7 @@ self.addEventListener('fetch', (event) => {
         }).catch(() => {
           // Graceful fallback for completely offline navigation requests
           if (request.mode === 'navigate') {
-            return caches.match('/');
+            return caches.match('./');
           }
         });
 

@@ -84,7 +84,6 @@ const saveCsvMiddleware = {
 export default defineConfig({
   base: '', // 关键：使用相对路径
   plugins: [react(), saveCsvMiddleware],
-  publicDir: false,
   // Redirect Vite's dep cache off the Z: network drive to avoid filesystem errors
   cacheDir: 'C:/Temp/vite-vacab-cache',
   server: {
