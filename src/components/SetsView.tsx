@@ -3,8 +3,8 @@ import { db, type WordSet, type Word, syncSeedsToDatabase, type SyncReport } fro
 import { fetchWordMetadata } from '../syncService';
 import { csvService } from '../services/csvService';
 import {
-  Plus, Trash2, Edit, ChevronRight, Download, Upload,
-  RefreshCw, X, FileText, Check, AlertCircle, ArrowLeft
+  Plus, Trash2, Edit, ChevronRight, Download,
+  RefreshCw, X, FileText, ArrowLeft
 } from 'lucide-react';
 
 interface SetCardRowProps {
@@ -91,44 +91,13 @@ export const SetsView: React.FC<SetsViewProps> = ({ onSelectSet, activeSetId }) 
     sentence3: ''
   });
 
-  // CSV Import States
-  const [isDragOver, setIsDragOver] = useState(false);
-  const [importStatus, setImportStatus] = useState<{ type: 'success' | 'error' | null, message: string }>({ type: null, message: '' });
-
-  // Bulk Sync Progress
-  const [syncProgress, setSyncProgress] = useState<{ active: boolean, current: number, total: number }>({ active: false, current: 0, total: 0 });
-
-  // Seed Sync & Persist States
+  // Seed Sync States
   const [syncReport, setSyncReport] = useState<SyncReport | null>(null);
   const [isSyncReportModalOpen, setIsSyncReportModalOpen] = useState(false);
   const [isSyncingSeeds, setIsSyncingSeeds] = useState(false);
-  const [isSavingSeed, setIsSavingSeed] = useState(false);
-  const [saveStatus, setSaveStatus] = useState<{ type: 'success' | 'error' | null, message: string }>({ type: null, message: '' });
-  const [isServerActive, setIsServerActive] = useState<boolean>(false);
 
   useEffect(() => {
     loadSets();
-
-    // Non-blocking local server presence check (600ms AbortController timeout)
-    const checkServer = async () => {
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 600);
-      try {
-        const res = await fetch('/api/health', { signal: controller.signal });
-        if (res.ok) {
-          const data = await res.json();
-          if (data && data.success) {
-            setIsServerActive(true);
-          }
-        }
-      } catch (err) {
-        // Fallback to standalone mode silently
-        setIsServerActive(false);
-      } finally {
-        clearTimeout(timeoutId);
-      }
-    };
-    checkServer();
   }, []);
 
   useEffect(() => {
@@ -299,31 +268,8 @@ export const SetsView: React.FC<SetsViewProps> = ({ onSelectSet, activeSetId }) 
     }
   };
 
-  const handleBulkSync = async () => {
-    if (!activeSetId || words.length === 0) return;
 
-    // Find all incomplete words
-    const incompleteWords = words.filter(w => !w.phonetic || !w.definition_en || !w.definition_ja);
-    if (incompleteWords.length === 0) {
-      alert('All words in this set already have complete metadata!');
-      return;
-    }
-
-    setSyncProgress({ active: true, current: 0, total: incompleteWords.length });
-
-    for (let i = 0; i < incompleteWords.length; i++) {
-      const w = incompleteWords[i];
-      setSyncProgress(prev => ({ ...prev, current: i + 1 }));
-      await triggerSingleWordSync(w.id!, w.word);
-      // Throttle for 600ms to avoid overloading the public APIs
-      await new Promise(resolve => setTimeout(resolve, 600));
-    }
-
-    setSyncProgress({ active: false, current: 0, total: 0 });
-    alert('Synchronization complete!');
-  };
-
-  // --- CSV Import & Export ---
+  // --- CSV Export ---
   const handleExportCSVForSet = async (setId: number, setName: string, e?: React.MouseEvent) => {
     if (e) e.stopPropagation();
     try {
@@ -356,126 +302,6 @@ export const SetsView: React.FC<SetsViewProps> = ({ onSelectSet, activeSetId }) 
     }
   };
 
-  const handleSaveToSeed = async () => {
-    if (!activeSet || words.length === 0) return;
-    setIsSavingSeed(true);
-    const escapeCsv = (str: string) => `"${(str || '').replace(/"/g, '""')}"`;
-    try {
-      const headers = ['Word', 'Phonetic', 'Definition_EN', 'Definition_JA', 'Sentence_1', 'Sentence_2', 'Sentence_3'];
-      const csvRows = [headers.join(',')];
-
-      for (const w of words) {
-        const row = [
-          escapeCsv(w.word),
-          escapeCsv(w.phonetic || ''),
-          escapeCsv(w.definition_en || ''),
-          escapeCsv(w.definition_ja || ''),
-          escapeCsv(w.sentences?.[0] || ''),
-          escapeCsv(w.sentences?.[1] || ''),
-          escapeCsv(w.sentences?.[2] || '')
-        ];
-        csvRows.push(row.join(','));
-      }
-
-      const csvContent = csvRows.join('\r\n');
-
-      const res = await fetch('/api/save-seed', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json'
-        },
-        body: JSON.stringify({
-          setName: activeSet.name,
-          csvContent
-        })
-      });
-
-      if (!res.ok) {
-        throw new Error('Server returned error response');
-      }
-
-      const data = await res.json();
-      if (data.success) {
-        setSaveStatus({ type: 'success', message: `Successfully persisted "${activeSet.name}" to local seeds folder!` });
-        setTimeout(() => setSaveStatus({ type: null, message: '' }), 4000);
-      } else {
-        throw new Error(data.error || 'Unknown error');
-      }
-    } catch (err: any) {
-      console.error('Failed to save to seed:', err);
-      setSaveStatus({
-        type: 'error',
-        message: 'Failed to write to local seeds. Please ensure the local VocabBloom server is running.'
-      });
-      setTimeout(() => setSaveStatus({ type: null, message: '' }), 6000);
-    } finally {
-      setIsSavingSeed(false);
-    }
-  };
-
-  const processCSVFile = async (file: File) => {
-    if (!activeSetId) return;
-
-    try {
-      const parsedRows = await csvService.parseCSVFile(file);
-      if (parsedRows.length === 0) {
-        setImportStatus({ type: 'error', message: 'The CSV file is empty, missing a "Word" header, or has no valid rows.' });
-        return;
-      }
-
-      const newWords: Omit<Word, 'id'>[] = parsedRows.map(row => ({
-        set_id: activeSetId,
-        word: row.word,
-        phonetic: row.phonetic || '',
-        definition_en: row.definition_en || '',
-        definition_ja: row.definition_ja || '',
-        sentences: row.sentences || [],
-        created_at: new Date()
-      }));
-
-      // Bulk insert
-      await db.words.bulkAdd(newWords);
-      loadActiveSet(activeSetId);
-      setImportStatus({ type: 'success', message: `Successfully imported ${newWords.length} words!` });
-
-      // Clear import status in 3 seconds
-      setTimeout(() => {
-        setImportStatus({ type: null, message: '' });
-      }, 3000);
-
-    } catch (err) {
-      console.error('Error importing CSV:', err);
-      setImportStatus({ type: 'error', message: 'Failed to parse CSV. Check file format.' });
-    }
-  };
-
-  const handleDragOver = (e: React.DragEvent) => {
-    e.preventDefault();
-    setIsDragOver(true);
-  };
-
-  const handleDragLeave = () => {
-    setIsDragOver(false);
-  };
-
-  const handleDrop = (e: React.DragEvent) => {
-    e.preventDefault();
-    setIsDragOver(false);
-    const file = e.dataTransfer.files?.[0];
-    if (file && file.name.endsWith('.csv')) {
-      processCSVFile(file);
-    } else {
-      setImportStatus({ type: 'error', message: 'Please upload a valid .csv file.' });
-    }
-  };
-
-  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (file) {
-      processCSVFile(file);
-    }
-  };
-
   // --- Render Word Set List ---
   if (!activeSet) {
     return (
@@ -483,28 +309,6 @@ export const SetsView: React.FC<SetsViewProps> = ({ onSelectSet, activeSetId }) 
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '24px' }}>
           <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-start' }}>
             <h2 style={{ marginBottom: '2px', fontSize: '20px' }}>My Word Sets 🗂️</h2>
-            <div style={{
-              display: 'inline-flex',
-              alignItems: 'center',
-              gap: '6px',
-              fontSize: '11px',
-              fontWeight: 600,
-              color: isServerActive ? 'var(--color-success)' : 'var(--text-secondary)',
-              backgroundColor: isServerActive ? 'var(--color-success-soft)' : 'var(--border-color)',
-              padding: '3px 8px',
-              borderRadius: '20px',
-              transition: 'all 0.3s ease',
-              opacity: 0.95
-            }}>
-              <span className={isServerActive ? 'pulsing-dot' : 'static-dot'} style={{
-                width: '6px',
-                height: '6px',
-                borderRadius: '50%',
-                backgroundColor: isServerActive ? 'var(--color-success)' : 'var(--text-secondary)',
-                display: 'inline-block'
-              }} />
-              {isServerActive ? 'Dev Connected' : 'Standalone Mode'}
-            </div>
           </div>
           <div style={{ display: 'flex', gap: '10px' }}>
             <button className="btn btn-outline" style={{ padding: '8px 14px', borderRadius: '12px' }} onClick={handleSyncSeeds} disabled={isSyncingSeeds}>
@@ -643,89 +447,7 @@ export const SetsView: React.FC<SetsViewProps> = ({ onSelectSet, activeSetId }) 
         </div>
       </div>
 
-      {/* Synchronize & Persist/Save to Seed bar */}
-      <div style={{ 
-        display: 'grid', 
-        gridTemplateColumns: isServerActive ? '1fr 1fr' : '1fr', 
-        gap: '10px', 
-        marginBottom: '16px' 
-      }}>
-        {isServerActive && (
-          <button className="btn btn-outline" style={{ padding: '10px', fontSize: '14px', borderRadius: '12px' }} onClick={handleSaveToSeed} disabled={words.length === 0 || isSavingSeed}>
-            <Download size={16} className={isSavingSeed ? 'animate-spin' : ''} style={{ display: 'inline', marginRight: '6px', verticalAlign: 'middle' }} />
-            {isSavingSeed ? 'Saving...' : 'Save to Seed 💾'}
-          </button>
-        )}
-        <button className="btn btn-primary" style={{ padding: '10px', fontSize: '14px', borderRadius: '12px' }} onClick={handleBulkSync} disabled={words.length === 0 || syncProgress.active}>
-          <RefreshCw size={16} className={syncProgress.active ? 'animate-spin' : ''} /> {syncProgress.active ? 'Syncing...' : 'Sync Set'}
-        </button>
-      </div>
 
-      {/* Sync progress indicator */}
-      {syncProgress.active && (
-        <div className="glass" style={{ padding: '12px 16px', marginBottom: '16px', borderRadius: '12px' }}>
-          <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '13px', marginBottom: '6px' }}>
-            <span>Syncing word definitions...</span>
-            <strong>{syncProgress.current} / {syncProgress.total}</strong>
-          </div>
-          <div className="progress-bar-container">
-            <div className="progress-bar-fill" style={{ width: `${(syncProgress.current / syncProgress.total) * 100}%` }}></div>
-          </div>
-        </div>
-      )}
-
-      {/* Drag & Drop Area */}
-      <div
-        className={`drag-drop-area ${isDragOver ? 'dragover' : ''}`}
-        onDragOver={handleDragOver}
-        onDragLeave={handleDragLeave}
-        onDrop={handleDrop}
-        style={{ marginBottom: '20px' }}
-      >
-        <Upload size={24} style={{ color: 'var(--color-primary)', marginBottom: '8px', opacity: 0.8 }} />
-        <p style={{ fontSize: '14px', fontWeight: 600, color: 'var(--text-primary)' }}>Import Words from CSV</p>
-        <p style={{ fontSize: '12px', marginTop: '2px' }}>Drag & drop your CSV file here, or click to upload</p>
-        <input type="file" accept=".csv" onChange={handleFileChange} style={{ display: 'none' }} id="csv-file-input" />
-        <label htmlFor="csv-file-input" className="btn btn-secondary" style={{ marginTop: '10px', padding: '6px 12px', fontSize: '13px', borderRadius: '8px' }}>
-          Select File
-        </label>
-      </div>
-
-      {/* Save Status Alert */}
-      {saveStatus.type && (
-        <div className={`glass`} style={{
-          padding: '12px 16px',
-          marginBottom: '20px',
-          borderRadius: '12px',
-          display: 'flex',
-          alignItems: 'center',
-          gap: '10px',
-          backgroundColor: saveStatus.type === 'success' ? 'var(--color-success-soft)' : 'var(--color-danger-soft)',
-          borderColor: saveStatus.type === 'success' ? 'var(--color-success)' : 'var(--color-danger)',
-          color: saveStatus.type === 'success' ? 'var(--color-success)' : 'var(--color-danger)'
-        }}>
-          {saveStatus.type === 'success' ? <Check size={18} /> : <AlertCircle size={18} />}
-          <span style={{ fontSize: '13px', fontWeight: 600 }}>{saveStatus.message}</span>
-        </div>
-      )}
-
-      {/* Import Status Alert */}
-      {importStatus.type && (
-        <div className={`glass`} style={{
-          padding: '12px 16px',
-          marginBottom: '20px',
-          borderRadius: '12px',
-          display: 'flex',
-          alignItems: 'center',
-          gap: '10px',
-          backgroundColor: importStatus.type === 'success' ? 'var(--color-success-soft)' : 'var(--color-danger-soft)',
-          borderColor: importStatus.type === 'success' ? 'var(--color-success)' : 'var(--color-danger)',
-          color: importStatus.type === 'success' ? 'var(--color-success)' : 'var(--color-danger)'
-        }}>
-          {importStatus.type === 'success' ? <Check size={18} /> : <AlertCircle size={18} />}
-          <span style={{ fontSize: '13px', fontWeight: 600 }}>{importStatus.message}</span>
-        </div>
-      )}
 
       {/* Quick Add Word bar */}
       <div style={{ display: 'flex', gap: '8px', marginBottom: '20px' }}>
@@ -740,7 +462,7 @@ export const SetsView: React.FC<SetsViewProps> = ({ onSelectSet, activeSetId }) 
       {words.length === 0 ? (
         <div className="glass" style={{ padding: '30px 16px', textAlign: 'center', marginTop: '12px', borderRadius: '16px' }}>
           <p style={{ fontSize: '14px' }}>No words added to this set yet.</p>
-          <p style={{ fontSize: '12px', marginTop: '4px' }}>Click "Add New Word" or upload a CSV file to begin!</p>
+          <p style={{ fontSize: '12px', marginTop: '4px' }}>Click "Add New Word" to begin!</p>
         </div>
       ) : (
         <div style={{ display: 'flex', flexDirection: 'column', gap: '10px', marginTop: '12px' }}>

@@ -1,5 +1,4 @@
 import Dexie, { type Table } from 'dexie';
-import { parseVocabularyCSV } from './csvUtils';
 
 export interface WordSet {
   id?: number;
@@ -55,56 +54,100 @@ export class VocabDatabase extends Dexie {
 
 export const db = new VocabDatabase();
 
-// Import all CSV files dynamically under src/data/seeds
-const csvModules = import.meta.glob('./data/seeds/*.csv', {
-  query: '?raw',
-  eager: true,
-}) as Record<string, { default: string }>;
-
 /**
- * Automatically seeds the database with preset word sets and words from local
- * static CSV resources during the initial launch, if the database is currently empty.
+ * Automatically seeds the database with preset word sets and words from the remote
+ * Turso libSQL database during the initial launch, if the local database is currently empty.
  * 
  * @returns {Promise<void>}
  */
 export async function seedDatabase() {
-  // Step 1: Check database count to skip seeding if data already exists (prevents overwriting user customizations)
   const setExactCount = await db.wordSets.count();
   if (setExactCount > 0) return; 
 
-  // Step 2: Loop through each dynamically imported seed CSV module
-  for (const [path, module] of Object.entries(csvModules)) {
-    const csvContent = module.default;
-    if (!csvContent) continue;
+  const tursoUrl = import.meta.env.VITE_TURSO_URL;
+  const tursoToken = import.meta.env.VITE_TURSO_TOKEN;
 
-    // Step 3: Derive a clean set name by parsing the CSV filename (e.g. "/seeds/Primary Basics 101 🌱.csv" -> "Primary Basics 101 🌱")
-    const filename = path.split('/').pop() || '';
-    const setName = filename.replace(/\.csv$/, '');
+  if (!tursoUrl || !tursoToken) {
+    console.warn('Turso connection details are not configured. Seeding skipped.');
+    return;
+  }
 
-    // Step 4: Register the new Word Set in the database and capture its auto-incremented primary key (setId)
-    const setId = await db.wordSets.add({
-      name: setName,
-      created_at: new Date()
+  const httpUrl = tursoUrl.replace(/^libsql:\/\//, 'https://') + '/v2/pipeline';
+
+  try {
+    const res = await fetch(httpUrl, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${tursoToken}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        requests: [
+          { type: 'execute', stmt: { sql: 'SELECT id, name, created_at FROM word_sets;' } },
+          { type: 'execute', stmt: { sql: 'SELECT set_id, word, phonetic, definition_en, definition_ja, sentences, created_at FROM words;' } }
+        ]
+      })
     });
 
-    // Step 5: Decode the CSV content using the RFC-4180 parsing core utility
-    const parsedRows = parseVocabularyCSV(csvContent);
-    const wordsToSeed: Omit<Word, 'id'>[] = parsedRows
-      .filter(row => row.word)
-      .map(row => ({
-        set_id: setId,
-        word: row.word,
-        phonetic: row.phonetic || '',
-        definition_en: row.definition_en || '',
-        definition_ja: row.definition_ja || '',
-        sentences: row.sentences || [],
-        created_at: new Date()
-      }));
+    if (!res.ok) {
+      throw new Error(`Turso HTTP Error: ${res.status}`);
+    }
 
-    // Step 6: Perform high-performance bulk insertions to populate words efficiently in a single operation
+    const data = await res.json();
+    if (!data.results || data.results.some((r: any) => r.type === 'error')) {
+      throw new Error('Turso query pipeline failed');
+    }
+
+    const setsResult = data.results[0].response.result;
+    const wordsResult = data.results[1].response.result;
+
+    const tursoToDexieSetId = new Map<number, number>();
+
+    // Step 1: Seed Word Sets
+    for (const row of setsResult.rows) {
+      const tursoId = parseInt(row[0].value, 10);
+      const name = row[1].value;
+      const created_at = new Date(row[2].value);
+
+      const dexieId = await db.wordSets.add({
+        name,
+        created_at
+      });
+      tursoToDexieSetId.set(tursoId, dexieId);
+    }
+
+    // Step 2: Seed Words
+    const wordsToSeed: Omit<Word, 'id'>[] = [];
+    for (const row of wordsResult.rows) {
+      const tursoSetId = parseInt(row[0].value, 10);
+      const dexieSetId = tursoToDexieSetId.get(tursoSetId);
+      if (!dexieSetId) continue;
+
+      let sentences: string[] = [];
+      try {
+        sentences = JSON.parse(row[5].value || '[]');
+      } catch (e) {
+        sentences = [];
+      }
+
+      wordsToSeed.push({
+        set_id: dexieSetId,
+        word: row[1].value,
+        phonetic: row[2].value || '',
+        definition_en: row[3].value || '',
+        definition_ja: row[4].value || '',
+        sentences,
+        created_at: new Date(row[6].value)
+      });
+    }
+
     if (wordsToSeed.length > 0) {
       await db.words.bulkAdd(wordsToSeed);
     }
+
+    console.log(`Successfully seeded database with ${setsResult.rows.length} sets and ${wordsToSeed.length} words from libSQL.`);
+  } catch (err) {
+    console.error('Failed to load seed data from libSQL:', err);
   }
 }
 
@@ -115,8 +158,8 @@ export interface SyncReport {
 }
 
 /**
- * Synchronizes the local database with static seed CSV files without removing or overwriting
- * existing user-modified words or learning records.
+ * Synchronizes the local IndexedDB database with vocabulary seeds retrieved dynamically
+ * from the remote Turso libSQL database without overwriting manual user modifications.
  * 
  * @returns {Promise<SyncReport>} A promise resolving to a report detailing added and preserved words.
  */
@@ -127,70 +170,120 @@ export async function syncSeedsToDatabase(): Promise<SyncReport> {
     skippedWords: []
   };
 
-  // Step 1: Iterate over statically mapped seed CSV resources
-  for (const [path, module] of Object.entries(csvModules)) {
-    const csvContent = module.default;
-    if (!csvContent) continue;
+  const tursoUrl = import.meta.env.VITE_TURSO_URL;
+  const tursoToken = import.meta.env.VITE_TURSO_TOKEN;
 
-    // Step 2: Derive the set name from the filename
-    const filename = path.split('/').pop() || '';
-    const setName = filename.replace(/\.csv$/, '');
+  if (!tursoUrl || !tursoToken) {
+    console.warn('Turso connection details are not configured. Sync skipped.');
+    return report;
+  }
 
-    // Step 3: Check if the word set already exists locally in IndexedDB
-    let wordSet = await db.wordSets.where('name').equals(setName).first();
-    let setId: number;
+  const httpUrl = tursoUrl.replace(/^libsql:\/\//, 'https://') + '/v2/pipeline';
 
-    if (!wordSet) {
-      // If missing, initialize a new set entry
-      setId = await db.wordSets.add({
-        name: setName,
-        created_at: new Date()
-      });
-    } else {
-      setId = wordSet.id!;
+  try {
+    const res = await fetch(httpUrl, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${tursoToken}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        requests: [
+          { type: 'execute', stmt: { sql: 'SELECT id, name, created_at FROM word_sets;' } },
+          { type: 'execute', stmt: { sql: 'SELECT set_id, word, phonetic, definition_en, definition_ja, sentences, created_at FROM words;' } }
+        ]
+      })
+    });
+
+    if (!res.ok) {
+      throw new Error(`Turso HTTP Error: ${res.status}`);
     }
 
-    // Step 4: Load existing words under this set to build an O(1) in-memory lookup map
-    // This allows sub-millisecond duplicate checks and preserves user manual modifications.
-    const existingWords = await db.words.where('set_id').equals(setId).toArray();
-    const existingWordMap = new Map<string, Word>();
-    for (const w of existingWords) {
-      existingWordMap.set(w.word.toLowerCase().trim(), w);
+    const data = await res.json();
+    if (!data.results || data.results.some((r: any) => r.type === 'error')) {
+      throw new Error('Turso query pipeline failed');
     }
 
-    // Step 5: Parse the static CSV content and build the batch import array
-    const parsedRows = parseVocabularyCSV(csvContent);
-    const wordsToAdd: Omit<Word, 'id'>[] = [];
+    const setsResult = data.results[0].response.result;
+    const wordsResult = data.results[1].response.result;
 
-    for (const row of parsedRows) {
-      if (!row.word) continue;
-      const normalizedWord = row.word.toLowerCase().trim();
+    // Group Turso words by their set ID
+    const setWordsMap = new Map<number, any[]>();
+    for (const row of wordsResult.rows) {
+      const setId = parseInt(row[0].value, 10);
+      const word = row[1].value;
+      const phonetic = row[2].value || '';
+      const definition_en = row[3].value || '';
+      const definition_ja = row[4].value || '';
+      let sentences: string[] = [];
+      try {
+        sentences = JSON.parse(row[5].value || '[]');
+      } catch {
+        sentences = [];
+      }
+      const created_at = new Date(row[6].value);
 
-      if (existingWordMap.has(normalizedWord)) {
-        // Increment skip count to preserve local changes and learning logs
-        report.skippedCount++;
-        if (!report.skippedWords.includes(row.word)) {
-          report.skippedWords.push(row.word);
-        }
-      } else {
-        // Register word for batch bulk insertion
-        wordsToAdd.push({
-          set_id: setId,
-          word: row.word,
-          phonetic: row.phonetic || '',
-          definition_en: row.definition_en || '',
-          definition_ja: row.definition_ja || '',
-          sentences: row.sentences || [],
+      if (!setWordsMap.has(setId)) {
+        setWordsMap.set(setId, []);
+      }
+      setWordsMap.get(setId)!.push({ word, phonetic, definition_en, definition_ja, sentences, created_at });
+    }
+
+    // Sync each word set
+    for (const row of setsResult.rows) {
+      const tursoSetId = parseInt(row[0].value, 10);
+      const setName = row[1].value;
+
+      // Check if word set exists in local IndexedDB
+      let wordSet = await db.wordSets.where('name').equals(setName).first();
+      let dexieSetId: number;
+
+      if (!wordSet) {
+        dexieSetId = await db.wordSets.add({
+          name: setName,
           created_at: new Date()
         });
-        report.addedCount++;
+      } else {
+        dexieSetId = wordSet.id!;
+      }
+
+      // Build quick O(1) in-memory duplicate check map of local words
+      const existingWords = await db.words.where('set_id').equals(dexieSetId).toArray();
+      const existingWordMap = new Map<string, Word>();
+      for (const w of existingWords) {
+        existingWordMap.set(w.word.toLowerCase().trim(), w);
+      }
+
+      const tursoWords = setWordsMap.get(tursoSetId) || [];
+      const wordsToAdd: Omit<Word, 'id'>[] = [];
+
+      for (const w of tursoWords) {
+        const normalizedWord = w.word.toLowerCase().trim();
+        if (existingWordMap.has(normalizedWord)) {
+          report.skippedCount++;
+          if (!report.skippedWords.includes(w.word)) {
+            report.skippedWords.push(w.word);
+          }
+        } else {
+          wordsToAdd.push({
+            set_id: dexieSetId,
+            word: w.word,
+            phonetic: w.phonetic,
+            definition_en: w.definition_en,
+            definition_ja: w.definition_ja,
+            sentences: w.sentences,
+            created_at: new Date()
+          });
+          report.addedCount++;
+        }
+      }
+
+      if (wordsToAdd.length > 0) {
+        await db.words.bulkAdd(wordsToAdd);
       }
     }
-
-    // Step 6: Commit all newly discovered vocabulary words inside a high-speed bulk database write
-    if (wordsToAdd.length > 0) {
-      await db.words.bulkAdd(wordsToAdd);
-    }
+  } catch (err) {
+    console.error('Failed to sync seeds from Turso:', err);
   }
 
   return report;

@@ -34,6 +34,9 @@ jobs:
         run: npm ci
 
       - name: Build project
+        env:
+          VITE_TURSO_URL: ${{ secrets.VITE_TURSO_URL }}
+          VITE_TURSO_TOKEN: ${{ secrets.VITE_TURSO_TOKEN }}
         run: npm run build
 
       - name: Setup Pages

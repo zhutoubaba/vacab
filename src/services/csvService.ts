@@ -1,33 +1,6 @@
-import { parseVocabularyCSV } from '../csvUtils';
 import { type Word } from '../db';
 
 export const csvService = {
-  /**
-   * Reads and parses a CSV File using FileReader and parseVocabularyCSV.
-   * Resolves with structured vocabulary rows or rejects if file reading/parsing fails.
-   * 
-   * @param {File} file - The uploaded local CSV file object.
-   * @returns {Promise<ReturnType<typeof parseVocabularyCSV>>} A promise resolving to standard parsed vocabulary rows.
-   */
-  async parseCSVFile(file: File): Promise<ReturnType<typeof parseVocabularyCSV>> {
-    return new Promise((resolve, reject) => {
-      const reader = new FileReader();
-      reader.onload = (e) => {
-        try {
-          const text = e.target?.result as string;
-          if (!text) {
-            return reject(new Error('Empty CSV file or failed to read contents.'));
-          }
-          const parsed = parseVocabularyCSV(text);
-          resolve(parsed);
-        } catch (err) {
-          reject(err);
-        }
-      };
-      reader.onerror = () => reject(new Error('Failed to read local CSV file.'));
-      reader.readAsText(file);
-    });
-  },
 
   /**
    * Formats vocabulary words as a standard RFC-4180 CSV string and triggers a browser download.
