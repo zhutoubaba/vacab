@@ -1,7 +1,43 @@
 const fs = require('fs');
 const path = require('path');
-const token = 'eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJhIjoicnciLCJpYXQiOjE3ODAwNTQ5OTcsImlkIjoiMDE5ZTczOGItNGUwMS03MzNlLWE0ZmItOTkxNDZmNjQxOGRkIiwicmlkIjoiNzJjODViY2QtNWRiZC00MmIyLThhMzktNjAzYmE2YWExNDllIn0.CwERuLGNDuw6g07x1UOgreLh0HBDfT1cs4rspU4Ac8QgCvSLuYanW-tvAYdU9FJMJRPlVhYPrE_3tqc5NR8LDQ';
-const url = 'https://vocab-zhutoubaba.aws-ap-northeast-1.turso.io/v2/pipeline';
+// Load environment variables from .env file
+const envPath = path.join(__dirname, '../.env');
+if (fs.existsSync(envPath)) {
+    const envContent = fs.readFileSync(envPath, 'utf8');
+    envContent.split(/\r?\n/).forEach(line => {
+        const trimmed = line.trim();
+        if (trimmed && !trimmed.startsWith('#')) {
+            const parts = trimmed.split('=');
+            if (parts.length >= 2) {
+                const key = parts[0].trim();
+                let val = parts.slice(1).join('=').trim();
+                if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) {
+                    val = val.slice(1, -1);
+                }
+                process.env[key] = val;
+            }
+        }
+    });
+}
+
+const rawUrl = process.env.VITE_TURSO_URL || process.env.TURSO_URL;
+const token = process.env.VITE_TURSO_TOKEN || process.env.TURSO_TOKEN;
+
+if (!rawUrl) {
+    throw new Error('VITE_TURSO_URL or TURSO_URL is not defined in .env file');
+}
+if (!token) {
+    throw new Error('VITE_TURSO_TOKEN or TURSO_TOKEN is not defined in .env file');
+}
+
+// Convert libsql:// to https:// and append /v2/pipeline if not already there
+let formattedUrl = rawUrl;
+if (formattedUrl.startsWith('libsql://')) {
+    formattedUrl = formattedUrl.replace('libsql://', 'https://');
+}
+const url = formattedUrl.endsWith('/v2/pipeline') 
+    ? formattedUrl 
+    : (formattedUrl.endsWith('/') ? `${formattedUrl}v2/pipeline` : `${formattedUrl}/v2/pipeline`);
 // Helper function to send requests to Turso
 async function executeSql(statements) {
     const requests = statements.map(stmt => {
@@ -166,8 +202,46 @@ async function run() {
             const setName = path.basename(file, '.csv');
             console.log(`\nImporting set: "${setName}"...`);
             const csvContent = fs.readFileSync(path.join(seedsDir, file), 'utf8');
-            const words = parseVocabularyCSV(csvContent);
+            let words = parseVocabularyCSV(csvContent);
             console.log(`Parsed ${words.length} words from "${file}"`);
+
+            // Detect duplicates and filter
+            const wordGroups = new Map();
+            for (const item of words) {
+                const normalized = item.word.toLowerCase().trim();
+                if (!wordGroups.has(normalized)) {
+                    wordGroups.set(normalized, []);
+                }
+                wordGroups.get(normalized).push(item);
+            }
+
+            const filteredWords = [];
+            for (const [key, group] of wordGroups.entries()) {
+                if (group.length > 1) {
+                    // Sort alphabetically to determine which to keep (keep the first one)
+                    group.sort((a, b) => {
+                        if (a.word !== b.word) return a.word.localeCompare(b.word);
+                        if (a.phonetic !== b.phonetic) return a.phonetic.localeCompare(b.phonetic);
+                        if (a.definition_en !== b.definition_en) return a.definition_en.localeCompare(b.definition_en);
+                        if (a.definition_ja !== b.definition_ja) return a.definition_ja.localeCompare(b.definition_ja);
+                        const aSent = JSON.stringify(a.sentences);
+                        const bSent = JSON.stringify(b.sentences);
+                        return aSent.localeCompare(bSent);
+                    });
+
+                    const chosen = group[0];
+                    const discarded = group.slice(1);
+                    console.warn(`\x1b[33m  [WARNING] Duplicate word "${key}" detected in "${file}". Keeping first in alphabetical order: "${chosen.word}"\x1b[0m`);
+                    discarded.forEach(item => {
+                        console.warn(`    -> Discarded duplicate: word="${item.word}", phonetic="${item.phonetic}", def_en="${item.definition_en}"`);
+                    });
+
+                    filteredWords.push(chosen);
+                } else {
+                    filteredWords.push(group[0]);
+                }
+            }
+            words = filteredWords;
             // Check if set already exists, otherwise insert it
             const existingSets = await executeSql([
                 { sql: 'SELECT id FROM word_sets WHERE name = ? LIMIT 1;', args: [{ type: 'text', value: setName }] }
@@ -237,16 +311,18 @@ async function run() {
                 if (!dbWord) {
                     wordsToInsert.push(csvWord);
                 } else {
-                    const needsUpdate = 
-                        csvWord.word !== dbWord.word ||
-                        csvWord.phonetic !== dbWord.phonetic ||
-                        csvWord.definition_en !== dbWord.definition_en ||
-                        csvWord.definition_ja !== dbWord.definition_ja ||
-                        JSON.stringify(csvWord.sentences) !== JSON.stringify(dbWord.sentences);
-                    
-                    if (needsUpdate) {
+                    const changedFields = [];
+                    if (csvWord.word !== dbWord.word) changedFields.push('word');
+                    if (csvWord.phonetic !== dbWord.phonetic) changedFields.push('phonetic');
+                    if (csvWord.definition_en !== dbWord.definition_en) changedFields.push('definition_en');
+                    if (csvWord.definition_ja !== dbWord.definition_ja) changedFields.push('definition_ja');
+                    if (JSON.stringify(csvWord.sentences) !== JSON.stringify(dbWord.sentences)) changedFields.push('sentences');
+
+                    if (changedFields.length > 0) {
                         wordsToUpdate.push({
                             id: dbWord.id,
+                            changedFields,
+                            dbWord,
                             ...csvWord
                         });
                     }
@@ -288,6 +364,17 @@ async function run() {
             }
 
             // 2. Update existing words
+            if (wordsToUpdate.length > 0) {
+                console.log(`  Updating ${wordsToUpdate.length} words...`);
+                for (const w of wordsToUpdate) {
+                    console.log(`    -> Update word "${w.word}" (ID: ${w.id}):`);
+                    w.changedFields.forEach(field => {
+                        const oldVal = field === 'sentences' ? JSON.stringify(w.dbWord[field]) : w.dbWord[field];
+                        const newVal = field === 'sentences' ? JSON.stringify(w[field]) : w[field];
+                        console.log(`       * ${field}: "${oldVal}" -> "${newVal}"`);
+                    });
+                }
+            }
             for (let i = 0; i < wordsToUpdate.length; i += batchSize) {
                 const batch = wordsToUpdate.slice(i, i + batchSize);
                 const updateStatements = batch.map(w => ({
@@ -306,6 +393,12 @@ async function run() {
             }
 
             // 3. Delete obsolete words
+            if (wordsToDelete.length > 0) {
+                console.log(`  Deleting ${wordsToDelete.length} words...`);
+                for (const w of wordsToDelete) {
+                    console.log(`    -> Delete word "${w.word}" (ID: ${w.id})`);
+                }
+            }
             for (let i = 0; i < wordsToDelete.length; i += batchSize) {
                 const batch = wordsToDelete.slice(i, i + batchSize);
                 const deleteStatements = batch.map(w => ({
